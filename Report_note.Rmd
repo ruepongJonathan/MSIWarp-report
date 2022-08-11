@@ -1,0 +1,346 @@
+---
+title: "Report on MSIWarp"
+output: html_notebook
+---
+
+# MSIWarp and Cardinal
+
+Author: Jonathan Ruepong
+
+## Summary
+
+MSIWarp provides a method for aligning spectra. MSIWarp runs on Python. Processing data are similar between Cardinal and MSIWarp. The difference starts before the actual alignment begins, where, after peak picking to provide reference spectra, the peaks picked in MSIWarp need to be sorted by intensity. This list of sorted peaks is given as a reference for MSIWarp.
+
+MSIWarp features node placements. From my understanding, nodes are used to space out spectra by segments, so that the same amount of information is equal between the reference spectra and the current spectra being warped. This means that in one segment if a peak is detected that needs warping within a segment then that information will need to be the same within all spectra being aligned. The placement of these nodes can dictate the quality of warping. MSIWarp offers two different methods of node placement. Either use the same warping nodes for all spectra or uniquely place them for each spectra.
+
+Note: This code was from the MSIWarp git repo
+
+```{python eval=FALSE, include=TRUE}
+#Setting up nodes to be used on all spectra
+node_mzs = [150, 450, 750, 1050]
+node_deltas = [0.015, 0.045, 0.075, 0.105] # slacks = node_deltas * n_steps
+n_steps = 25 
+nodes = mx.initialize_nodes(node_mzs, node_deltas, n_steps)
+
+#Setting up nodes uniquely for each spectra
+params = mx.params_uniform(mx.Instrument.Orbitrap, # each instrument type has its own relationship between peak width and m/z
+                           n_steps, # same as above
+                           n_peaks, # the number of peaks per segment
+                           max_n_nodes, # maximum number of nodes
+                           mz_begin, # 
+                           mz_end, #
+                           slack # the slack relative to peak width
+                           )
+```
+
+## Code used
+
+The following are code snippets used to see what MSIWarp can do compared to Cardinal. As of now, I was not able to get MSIWarp to work as intended. I only got it to work on one dataset that was on the MSIWarp paper.
+
+Loading cardinal and creating test simulated data
+
+```{r echo=TRUE, results="hide"}
+library(Cardinal)
+set.seed(2022)
+ori <- simulateImage(preset=1, npeaks=10, from=500, to=600,sdmz=750, units="ppm")
+ori
+```
+
+Exporting simulated data to use in MSIWarp
+
+```{r eval=FALSE, include=TRUE}
+path <- tempfile()
+writeMSIData(ori, file=path, outformat="imzML")
+```
+
+Plotting the simulated data
+
+```{r echo=TRUE}
+plot(ori)
+```
+
+Make reference by using Cardinal
+
+```{r echo=TRUE}
+ori_mean <- summarizeFeatures(ori)
+ori_peaks <- peakPick(ori_mean, SNR=2)
+ori_peaks <- peakAlign(ori_peaks, tolerance=1000, units="ppm")
+ori_peaks <- process(ori_peaks)
+```
+
+Export the reference as a imzML file Note: This is used for MSIWarp, as at the time, to check mainly if MSIWarp was actually warping the originally spectra.
+
+```{r eval=FALSE, include=TRUE}
+path <- tempfile()
+writeMSIData(ori_mean, file=path, outformat="imzML")
+```
+
+Python code using MSIWarp with the simulated data
+
+```{python eval=FALSE, include=TRUE}
+import msiwarp as mx
+from pyimzml.ImzMLParser import ImzMLParser
+
+from msiwarp.util.warp import to_mx_peaks, to_mz, to_height
+from msiwarp.util.warp import generate_mean_spectrum, plot_range
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+#Setting up nodes, this setup is taken from the git repo for MSIWarp
+node_mzs = [500, 530, 580, 600]
+node_deltas = [0.05, 0.053, 0.058, 0.06] # slacks = node_deltas * n_steps
+n_steps = 25
+nodes = mx.initialize_nodes(node_mzs, node_deltas, n_steps)
+epsilon = 1.0
+
+#code to load in unaligned spectrum
+p = ImzMLParser("simTest2.imzML")
+spectra = []
+
+for idx, coords in enumerate(p.coordinates):
+    mzs, hs = p.getspectrum(idx)
+    spectra.append(to_mx_peaks(mzs, hs,
+                               1.0, id = idx))
+
+# choose a reference spectrum
+ref = ImzMLParser("simTest2_Ref.imzML")
+ref_spec = []
+
+for idx, coords in enumerate(ref.coordinates):
+    mzs, hs = ref.getspectrum(idx)
+    ref_spec.append(to_mx_peaks(mzs, hs,
+                               1.0, id = idx))
+    
+
+#NOTE: Currently this does not work
+#The goal was to take the reference given from cardinal and use
+#peaks_top_n which sorts the peaks picked by intensity
+''' 
+ref_100 = mx.peaks_top_n(ref_spec, 100)
+mz_ref = np.sort(to_mz(ref_100))
+'''
+
+#This section of code is taken from the example given from the git repo
+#for MSIWarp. This sets up a reference spectra that will be used for the
+#warping function below
+i_r = 0
+s_r = ref_spec[i_r]
+
+
+print("warping spectra...")
+
+import time
+t0 = time.time()
+optimal_moves = mx.find_optimal_spectra_warpings(spectra, s_r, nodes, epsilon) #uses ms_ref instead of s_r
+t1 = time.time()
+print("found optimal warpings in {:0.2f}s".format(t1 - t0))
+
+t2 = time.time()
+warped_spectra = [mx.warp_peaks(s_i, nodes, o_i) for (s_i, o_i) in zip(spectra, optimal_moves)]
+t3 = time.time()
+print("warped spectra in {:0.2f}s".format(t3 - t2))
+
+#This code is to export the aligned spectra to be used in cardinal for
+#comparison. It is currently commented off.
+'''
+from pyimzml.ImzMLWriter import ImzMLWriter
+
+output_imzml = 'msiwarp_Test8.imzML'
+with ImzMLWriter(output_imzml) as w:
+    for s_i, coords in zip(warped_spectra, p.coordinates):
+        # writes data to the .ibd file
+        w.addSpectrum(to_mz(s_i), to_height(s_i), coords)
+'''
+
+```
+
+Run Cardinal Alignment on simulated data comparsion
+
+```{r, include=TRUE}
+ori_align1 <- mzAlign(ori, ref=mz(ori_peaks), tolerance=2000, units="ppm")
+ori_align1 <- process(ori_align1)
+```
+
+Loading MSIWarp alignment results of the simulated data
+
+```{r, include=TRUE}
+path_in <- paste0("msiwarp_Test7", ".imzML")
+MSIWarp <- readMSIData(path_in, attach.only=TRUE)
+MSIWarp
+centroided(MSIWarp) = FALSE
+```
+
+Plotting original simulated data, reference used, xxx pixel for Cardinal and MSIWarp aligned spectra.
+
+```{r echo=TRUE}
+#Set the pixel(s) to look at
+curr_pixel = c(193,195)
+
+#plot original
+plot(ori, pixel= curr_pixel, key=FALSE, superpose=TRUE, main="Original")
+
+#plot ref used in cardinal and MSIWarp
+plot(ori_peaks, main="Reference")
+
+#Plot cardinals alignment
+plot(ori_align1, pixel=curr_pixel, key=FALSE, superpose=TRUE, main="Cardinal's method")
+
+#plotting for the MSIWarp alignment results for the current pixel
+plot(MSIWarp, pixel= curr_pixel, key=FALSE, superpose=TRUE, main="MSIWarp method")
+
+
+```
+
+MSIWarp data featured on paper. Data named "A67 CT S4-centroid" (named MSIWarp_orbitrap_desi )
+
+```{r include=TRUE}
+path_in <- paste0("A67 CT S4-centroid", ".imzML")
+MSIWarp_orbitrap_desi <- readMSIData(path_in, attach.only=TRUE)
+MSIWarp_orbitrap_desi
+centroided(MSIWarp_orbitrap_desi) = FALSE
+
+path_in <- paste0("msiwarp_Test_orbi_desi_1", ".imzML")
+MSIWarp_orbitrap_desi_align <- readMSIData(path_in, attach.only=TRUE)
+MSIWarp_orbitrap_desi_align
+centroided(MSIWarp_orbitrap_desi_align) = FALSE
+```
+
+Using Cardinals alignment method
+
+```{r echo=TRUE}
+MSIWarp_orbitrap_desi
+
+orbitrap_mean <- summarizeFeatures(MSIWarp_orbitrap_desi)
+orbitrap_peaks <- peakPick(orbitrap_mean, SNR=2)
+orbitrap_peaks <- peakAlign(orbitrap_peaks, tolerance=1000, units="ppm")
+orbitrap_peaks <- process(orbitrap_peaks)
+
+#print/plot resulting alignment
+orbitrap_align1 <- mzAlign(MSIWarp_orbitrap_desi, ref=mz(orbitrap_peaks), tolerance=2000, units="ppm")
+orbitrap_align1 <- process(orbitrap_align1)
+
+```
+
+Python code that works with the data. This code is a snippet from an example used in the git repo for MSIWarp (file: warp_orbitrap_desi.py)
+
+```{python eval=FALSE, include=TRUE}
+
+import msiwarp as mx
+
+from msiwarp.util.warp import to_mx_peaks, to_mz, to_height
+from msiwarp.util.warp import generate_mean_spectrum, plot_range
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+imzml_path = "A67 CT S4-centroid.imzML"
+
+# experiment settings
+sigma_1 = 3.0e-7
+epsilon = 1.0
+instrument_type = 'orbitrap'
+
+# --------- load spectra and meta data ----------
+from pyimzml.ImzMLParser import ImzMLParser
+from msiwarp.util.warp import to_mx_peaks
+
+p = ImzMLParser("A67 CT S4-centroid.imzML")
+spectra = []
+
+for idx, coords in enumerate(p.coordinates):
+    mzs, hs = p.getspectrum(idx)    
+    spectra.append(to_mx_peaks(mzs, hs,
+                               sigma_1, id = idx,
+                               instrument_type = instrument_type))
+
+
+tic = np.array([np.sum(to_height(s_i)) for s_i in spectra])
+n_peaks = np.array([len(s_i) for s_i in spectra])
+
+
+# ---------- use uniform node placement function ----------
+n_steps = 33
+n_peaks_min = 30
+n_nodes = 8
+mz_begin = 175
+mz_end = 1000
+slack = 2.0 * epsilon * sigma_1
+
+params = mx.params_uniform(mx.Instrument.Orbitrap,
+                           n_steps,
+                           n_peaks_min,
+                           n_nodes,
+                           mz_begin,
+                           mz_end,
+                           slack)
+
+
+
+
+# ---------- mean spectrum ----------
+n_points = 2000000
+s_m = generate_mean_spectrum(spectra, n_points, sigma_1,
+                             mz_begin, mz_end, tic, instrument_type)
+
+print("using mean spectrum as reference")
+s_m_1000 = mx.peaks_top_n(s_m, 1000) # returns peak list sorted by intensity, not m/z
+s_ref = sorted(s_m_1000, key=lambda peak: peak.mz)
+
+s_m_100 = mx.peaks_top_n(s_m, 100)
+mz_ref = np.sort(to_mz(s_m_100))
+
+
+
+# ---------- warp spectra ----------
+print("warping spectra...")
+
+import time
+
+n_cores = 8
+
+t0 = time.time()
+warping_funcs = mx.find_optimal_warpings_uni(spectra, s_ref, params, epsilon, n_cores)
+t1 = time.time()
+print("found optimal warpings in {:0.2f} seconds".format(t1 - t0))
+
+t2 = time.time()
+warped_spectra = [mx.warp_peaks_unique(s_i, r_i) for (s_i, r_i) in zip(spectra, warping_funcs)]
+t3 = time.time()
+print("warped spectra in {:0.2f}s".format(t3 - t2))
+
+
+#This code is to export the aligned spectra to be used in cardinal for
+#comparesion. It is currently commented off.
+
+''' 
+from pyimzml.ImzMLWriter import ImzMLWriter
+
+output_imzml = 'msiwarp_Test_orbi_desi_1.imzML'
+with ImzMLWriter(output_imzml) as w:
+    for s_i, coords in zip(warped_spectra, p.coordinates):
+        # writes data to the .ibd file
+        w.addSpectrum(to_mz(s_i), to_height(s_i), coords)
+'''
+
+```
+
+plotting original, MSIWarp, and Cardinal aligned spectra
+
+```{r, echo=FALSE}
+temp_pixel = c(4000:4050)
+xlim=c(700,850)
+ylim=c(0,3000)
+
+plot(MSIWarp_orbitrap_desi, key=FALSE, superpose=TRUE, main="Original")
+plot(MSIWarp_orbitrap_desi_align, superpose=TRUE, key=FALSE, main="MSIWarp method")
+plot(orbitrap_align1, key=FALSE, superpose=TRUE, main="Cardinal method")
+```
+
+## References
+
+1.  MSIWarp - <https://pubs.acs.org/doi/full/10.1021/acs.analchem.0c03833>
+
+2.  MSIWarp Git Repo- <https://github.com/horvatovichlab/MSIWarp>
+
+3.  MSIWarp Data - <https://www.ebi.ac.uk/metabolights/MTBLS289/files>
